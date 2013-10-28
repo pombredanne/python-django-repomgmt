@@ -15,8 +15,8 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 #
-from datetime import date
 from glob import glob
+from datetime import date
 import logging
 import os
 import os.path
@@ -35,6 +35,7 @@ import tty
 
 from django.conf import settings
 from django.contrib.auth.models import User
+#from django.core.mail import email_admins
 from django.core.urlresolvers import reverse
 from django.db import models
 from django.template.loader import render_to_string
@@ -46,6 +47,7 @@ if settings.TESTING:
 else:
     from novaclient.v1_1 import client
 
+from novaclient import exceptions as novaclient_exceptions
 
 from repomgmt import utils
 from repomgmt.exceptions import CommandFailed
@@ -61,6 +63,10 @@ class Repository(models.Model):
 
     class Meta:
         verbose_name_plural = "repositories"
+
+    @classmethod
+    def allow_unprivileged_creation(cls):
+        return True
 
     def __unicode__(self):
         return self.name
@@ -127,14 +133,16 @@ class Repository(models.Model):
         basedir = os.path.normpath(os.path.join(settings_module_dir,
                                                 os.pardir))
 
-        for d in [settings.BASE_PUBLIC_REPO_DIR,
-                  confdir, self.reprepro_incomingdir]:
+        for d, setgid in [(settings.BASE_PUBLIC_REPO_DIR, False),
+                          (confdir, False), (self.reprepro_incomingdir, True)]:
             if not os.path.exists(d):
                 os.makedirs(d)
+                if setgid:
+                    os.chmod(d, 02775)
 
         for f in ['distributions', 'incoming', 'options', 'pulls',
                   'uploaders', 'create-build-records.sh', 'dput.cf',
-                  'process-changes.sh', 'updates']:
+                  'process-changes.sh', 'import-dsc-to-git.sh', 'updates']:
             s = render_to_string('reprepro/%s.tmpl' % (f,),
                                  {'repository': self,
                                   'architectures': Architecture.objects.all(),
@@ -157,6 +165,21 @@ class Repository(models.Model):
         self.create_key()
         return super(Repository, self).save(*args, **kwargs)
 
+    def can_modify(self, user):
+        # A side effect of using the name as the primary key is that
+        # this check isn't super useful
+        if self.pk is None:
+            return True
+
+        # ..instead we need to resort to this :(
+        if self.__class__.objects.filter(pk=self.pk).count() == 0:
+            return True
+
+        if user.is_superuser:
+            return True
+        if user in self.uploaders.filter(id=user.id):
+            return True
+        return False
 
 class UploaderKey(models.Model):
     key_id = models.CharField(max_length=200, primary_key=True)
@@ -260,6 +283,11 @@ class Series(models.Model):
                     subscription.save()
 
             self.update()
+
+    def can_modify(self, user):
+        if self.repository_id is None:
+            return True
+        return self.repository.can_modify(user)
 
     def freeze(self):
         self.state = Series.FROZEN
@@ -406,6 +434,7 @@ class ChrootTarball(models.Model):
             cmd = ['mk-sbuild']
             cmd += ['--name=%s' % (self.series.name,)]
             cmd += ['--arch=%s' % (self.architecture.name)]
+            cmd += ['--eatmydata']
             cmd += ['--type=file']
             cmd += mk_sbuild_extra_args
             cmd += [self.series.name]
@@ -570,7 +599,7 @@ class BuildRecord(models.Model):
             return
         elif summary['Status'] == 'failed':
             # Some dependencies could not be fulfilled.
-            if summary['Fail-Stage'] == 'intall-deps':
+            if summary['Fail-Stage'] == 'install-deps':
                 logger.debug('Build summary says installing deps failed for '
                              'build %r. Setting state accordingly.' % (self,))
                 self.update_state(self.DEPENDENCY_WAIT)
@@ -737,9 +766,9 @@ class BuildNode(models.Model):
             self._run_cmd(textwrap.dedent('''\n
                           cat <<EOF > keygen.param
                           Key-Type: 1
-                          Key-Length: 4096
+                          Key-Length: 2048
                           Subkey-Type: ELG-E
-                          Subkey-Length: 4096
+                          Subkey-Length: 2048
                           Name-Real: %s signing key
                           Expire-Date: 0
                           %%commit
@@ -846,6 +875,20 @@ class BuildNode(models.Model):
         logger.info('Creating server %s on cloud %s' % (name, cloud))
         srv = cl.servers.create(name, image, flavor, key_name=keypair.name)
 
+        timeout = time.time() + 120
+        succeeded = False
+        while timeout > time.time():
+            if srv.status == 'BUILD':
+                time.sleep(3)
+                srv = cl.servers.get(srv.id)
+            else:
+                succeeded = True
+                break
+
+        if not succeeded:
+            srv.delete()
+            raise Exception('Failed to launch instance')
+
         if getattr(settings, 'USE_FLOATING_IPS', False):
             logger.info('Grabbing floating ip for server %s on cloud %s' %
                         (name, cloud))
@@ -863,6 +906,7 @@ class BuildNode(models.Model):
                 try:
                     srv.add_floating_ip(floating_ip.ip)
                     succeeded = True
+                    break
                 except:
                     pass
                 time.sleep(1)
@@ -901,18 +945,24 @@ class BuildNode(models.Model):
 
     def delete(self):
         if getattr(settings, 'USE_FLOATING_IPS', False):
-            floating_ip = self.ip
-            ref = self.cloud.client.floating_ips.find(ip=floating_ip)
-            logger.info('Unassigning floating ip %s from server %s on '
-                        'cloud %s.' % (floating_ip, self, self.cloud))
-            self.cloud_server.remove_floating_ip(floating_ip)
-            logger.info('Deleting floating ip %s on cloud %s.' %
-                        (floating_ip, self.cloud))
-            ref.delete()
+            try:
+                floating_ip = self.ip
+                ref = self.cloud.client.floating_ips.find(ip=floating_ip)
+                logger.info('Unassigning floating ip %s from server %s on '
+                            'cloud %s.' % (floating_ip, self, self.cloud))
+                self.cloud_server.remove_floating_ip(floating_ip)
+                logger.info('Deleting floating ip %s on cloud %s.' %
+                            (floating_ip, self.cloud))
+                ref.delete()
+            except novaclient_exceptions.NotFound:
+                logger.info('Node already gone, unable to release floating ip')
 
         logger.info('Deleting server %s on cloud %s.' %
                     (self, self.cloud))
-        self.cloud_server.delete()
+        try:
+            self.cloud_server.delete()
+        except novaclient_exceptions.NotFound:
+            logger.info('Node already gone, unable to delete it')
 
         if self.signing_key_id:
             logger.info('Deleting signing key for build node %s: %s' %
@@ -1009,7 +1059,7 @@ class BuildNode(models.Model):
 class TarballCacheEntry(models.Model):
     project_name = models.CharField(max_length=200)
     project_version = models.CharField(max_length=200)
-    rev_id = models.CharField(max_length=200, db_index=True)
+    rev_id = models.CharField(max_length=200, db_index=True, unique=True)
 
     def project_tarball_dir(self):
         return os.path.join(settings.TARBALL_DIR, self.project_name)
@@ -1025,6 +1075,26 @@ class TarballCacheEntry(models.Model):
             os.makedirs(self.project_tarball_dir())
 
         shutil.copy(filename, self.filepath())
+
+class PackageSourceBuildProblem(models.Model):
+    name = models.CharField(max_length=200)
+    code_url = models.CharField(max_length=200)
+    packaging_url = models.CharField(max_length=200)
+    code_rev = models.CharField(max_length=200)
+    pkg_rev = models.CharField(max_length=200)
+    flavor = models.CharField(max_length=200)
+    timestamp = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    def save_log(self, contents):
+        with open(self.log_file(), 'w') as fp:
+            return fp.write(contents)
+
+    def log_file(self):
+        return os.path.join(settings.SRC_PKG_BUILD_FAILURE_LOG_DIR, str(self.pk))
+
+    def log_file_contents(self):
+        with open(self.log_file(), 'r') as fp:
+            return fp.read()
 
 
 class PackageSource(models.Model):
@@ -1135,7 +1205,7 @@ class PackageSource(models.Model):
 
             return self.PKG_VERSION_FORMAT % {'epoch': epoch,
                                               'orig_version': orig_version,
-                                              'repository_name': subscription.target_series.repository.name}
+                                              'repository_name': subscription.target_series.repository.name.replace('-', '')}
 
         def changelog_entry(self):
             return ('Automated PPA build. Code revision: %s. '
@@ -1159,10 +1229,26 @@ class PackageSource(models.Model):
                               override_env={'DEBEMAIL': 'not-valid@example.com',
                                             'DEBFULLNAME': '%s Autobuilder' % (subscription.target_series.repository.name)})
 
-                utils.run_cmd(['bzr', 'bd', '-S',
-                               '--builder=dpkg-buildpackage -nc -k%s' % subscription.target_series.repository.signing_key_id,
-                               ],
-                              cwd=subscription.pkgdir)
+                try:
+                    utils.run_cmd(['bzr', 'bd', '-S',
+                                  '--builder=dpkg-buildpackage -nc -k%s' % subscription.target_series.repository.signing_key_id,
+                                  ],
+                                  cwd=subscription.pkgdir)
+                except CommandFailed, e:
+                    errmsg = ('%r failed.\nExit code: %d\nStdout: %s\n\n'
+                              'Stderr: %s\n' % (e.cmd, e.returncode,
+                                                e.stdout, e.stderr))
+                    psbp = PackageSourceBuildProblem(name=self.source.name,
+                                                     code_url=self.source.code_url,
+                                                     packaging_url=self.source.packaging_url,
+                                                     code_rev=self.code_revision,
+                                                     pkg_rev=self.pkg_revision,
+                                                     flavor=self.source.flavor)
+                    psbp.save()
+                    psbp.save_log(errmsg)
+
+#                    email_admins('"bzr bd" failed for %r' % (self,), errmsg)
+                    raise
 
                 changes_files = glob(os.path.join(subscription.tmpdir, '*.changes'))
 
@@ -1426,8 +1512,15 @@ class PackageSource(models.Model):
             utils.run_cmd(['git', 'reset', '--hard', revision], cwd=destdir)
             utils.run_cmd(['git', 'clean', '-dfx'], cwd=destdir)
 
+    def can_modify(self, user):
+        return all(x.can_modify(user) for x in self.subscription_set.all())
+
 
 class Subscription(models.Model):
     source = models.ForeignKey(PackageSource)
     target_series = models.ForeignKey(Series)
     counter = models.IntegerField()
+
+    def can_modify(self, user):
+        return self.target_series.can_modify(user)
+

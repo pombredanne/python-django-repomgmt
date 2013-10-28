@@ -15,20 +15,24 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 #
+import datetime
 from django.conf import settings
 from django.contrib.auth.decorators import login_required
 from django.contrib.auth.models import User
 from django.contrib.sites.models import get_current_site
+from django.core.paginator import Paginator, EmptyPage, PageNotAnInteger
 from django.core.urlresolvers import reverse
 from django.forms import ModelForm
 from django.http import HttpResponse, HttpResponseRedirect
 from django.shortcuts import render, get_object_or_404
+from django.utils import timezone
 
 
 from repomgmt import utils, tasks
 from repomgmt.models import Architecture, BuildNode, BuildRecord
 from repomgmt.models import ChrootTarball, Repository, Series
 from repomgmt.models import UbuntuSeries, PackageSource, Subscription
+from repomgmt.models import PackageSourceBuildProblem
 
 
 class NewArchitectureForm(ModelForm):
@@ -109,8 +113,17 @@ def pkg_sources_list(request):
             else:
                 return new_pkg_source_form(request)
 
+    t = timezone.now() - datetime.timedelta(hours=1)
+    latest_problems = PackageSourceBuildProblem.objects.filter(timestamp__gte=t).order_by('-timestamp')
     return render(request, 'pkg_sources.html',
-                          {'pkg_sources': PackageSource.objects.all()})
+                          {'pkg_sources': PackageSource.objects.all(),
+                           'latest_problems': latest_problems})
+
+
+def problem_detail(request, problem_id):
+    problem = PackageSourceBuildProblem.objects.get(id=problem_id)
+    return render(request, 'pkg_src_build_problem.html',
+                           {'problem': problem})
 
 
 def architecture_list(request):
@@ -165,7 +178,8 @@ def series_list(request, repository_name):
                 return new_series_form(request, repository_name)
 
     return render(request, 'seriess.html',
-                          {'repository': repository})
+                          {'repository': repository,
+                           'settings': settings})
 
 
 def package_list(request, repository_name, series_name):
@@ -179,10 +193,12 @@ def package_list(request, repository_name, series_name):
                 pkg_data[pkg_name] = {}
             pkg_data[pkg_name][distribution_name] = pkg_version
 
+    l = [dict(name=pkg_name, **data) for pkg_name, data in pkg_data.iteritems()]
+
     return render(request, 'packages.html',
                           {'series': series,
                            'subscriptions': series.subscription_set.all(),
-                           'pkg_data': pkg_data})
+                           'pkg_data': l})
 
 
 def promote_series(request):
@@ -235,8 +251,20 @@ def build_detail(request, build_id):
 
 
 def build_list(request):
+    builds = BuildRecord.objects.order_by('-created')
+    paginator = Paginator(builds, 25)
+
+    page = request.GET.get('page')
+    try:
+        builds = paginator.page(page)
+    except PageNotAnInteger:
+        # If page is not an integer, deliver first page.
+        builds = paginator.page(1)
+    except EmptyPage:
+        # If page is out of range (e.g. 9999), deliver last page of results.
+        builds = paginator.page(paginator.num_pages)
     return render(request, 'builds.html',
-                          {'build_records': BuildRecord.objects.order_by('-created')})
+                          {'build_records': builds})
 
 
 def tarball_list(request):

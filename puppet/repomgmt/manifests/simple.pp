@@ -1,5 +1,17 @@
-class repomgmt($user = 'ubuntu') {
+class repomgmt::simple($user = 'ubuntu',
+                       $admin_name = "Admin User",
+                       $admin_email = "email@example.com",
+                       $dbname = "repomgmt",
+                       $dbuser = "repomgmt",
+                       $dbpass = "repomgmtpass",
+                       $dbhost = "",
+                       $dbport = "",
+                       $secret_key = '!tuy9ozxr@zhr$8v3$41^3690dfnrim16yj8x5)4pi0bg%140l',
+                       $ftp_ip = $::ipaddress,
+                       $post_mk_sbuild_customisation = undef,
+                       $use_ec2_metadata_service = false) {
   $simple = true
+  $project_name = 'buildd'
 
   package { ["python-pip",
              "devscripts",
@@ -10,18 +22,27 @@ class repomgmt($user = 'ubuntu') {
              "ubuntu-dev-tools",
              "reprepro",
              "haveged",
-             "vsftpd"]:
+             "vsftpd",
+             "python-dev"]:
     provider => "apt",
     ensure => "installed",
   }
 
-  package { ["Django",
-             "django-celery",
+  Package["python-dev"] -> Package<| provider == 'pip' |>
+
+  package { ["django-celery",
              "django-tastypie",
+             "django-registration",
              "python-novaclient",
              "south"]:
     provider => "pip",
     ensure => "installed",
+    require => Package['python-pip']
+  }
+
+  package { "Django":
+    provider => "pip",
+    ensure => "1.4.3",
     require => Package['python-pip']
   }
 
@@ -33,6 +54,7 @@ class repomgmt($user = 'ubuntu') {
     ensure => "present",
     managehome => true,
     groups => "sbuild",
+    shell => "/bin/bash",
     require => Package['sbuild']
   }
 
@@ -50,6 +72,18 @@ class repomgmt($user = 'ubuntu') {
     owner => $user
   } ~>
   exec { "/usr/bin/python /home/$user/buildd/manage.py syncdb --noinput":
+    user => $user,
+    refreshonly => true
+  } ~>
+  exec { "/usr/bin/python /home/$user/buildd/manage.py migrate djcelery --noinput":
+    user => $user,
+    refreshonly => true
+  } ~>
+  exec { "/usr/bin/python /home/$user/buildd/manage.py migrate repomgmt --noinput":
+    user => $user,
+    refreshonly => true
+  } ~>
+  exec { "/usr/bin/python /home/$user/buildd/manage.py migrate tastypie --noinput":
     user => $user,
     refreshonly => true
   }

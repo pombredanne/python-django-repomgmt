@@ -15,13 +15,18 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 #
+from base64 import b64encode
+from contextlib import contextmanager
+import json
 import mock
 import textwrap
+from StringIO import StringIO
 
+from django.contrib.auth.models import User
 from django.test import TestCase, client
 from django.test.utils import override_settings
 from repomgmt.models import Cloud, BuildNode, BuildRecord, KeyPair, Repository
-from repomgmt.models import Series
+from repomgmt.models import Series, UploaderKey, PackageSource, Subscription
 
 
 class CloudTests(TestCase):
@@ -216,10 +221,12 @@ class RepositoryTests(TestCase):
         self.assertContains(response,
                             '<form action="/repositories/" method="post">')
 
-        response = c.post('/repositories/', {'action': 'create',
-                                             'name': 'foo',
-                                             'contact': 'foo@example.com'})
-        self.assertRedirects(response, '/repositories/')
+        with mock.patch('repomgmt.models.Repository.create_key') as create_key:
+            response = c.post('/repositories/', {'action': 'create',
+                                                 'name': 'foo',
+                                                 'contact': 'foo@example.com'})
+            self.assertRedirects(response, '/repositories/')
+            create_key.assert_called_with()
 
         new_repos = set(Repository.objects.all()) - repo_set
         self.assertEquals(len(new_repos), 1)
@@ -227,3 +234,280 @@ class RepositoryTests(TestCase):
 
         self.assertEquals(new_repo.name, 'foo')
         self.assertEquals(new_repo.contact, 'foo@example.com')
+
+class ImportDscToGitCommandTests(TestCase):
+    def setUp(self):
+        mod = __import__("repomgmt.management.commands.repo-import-dsc-to-git")
+        self.module = getattr(mod.management.commands, 'repo-import-dsc-to-git')
+        return super(ImportDscToGitCommandTests, self).setUp()
+
+    def test_get_repository_name(self):
+        basedir = '/base/dir'
+        with self.settings(BASE_REPO_DIR=basedir):
+            name = self.module.get_repository_name({}, {'REPREPRO_BASE_DIR': '/base/dir/myrepo'})
+            self.assertEquals(name, 'myrepo')
+
+    def test_get_repository_name_trailing_slash(self):
+        basedir = '/base/dir'
+        with self.settings(BASE_REPO_DIR=basedir):
+            name = self.module.get_repository_name({}, {'REPREPRO_BASE_DIR': '/base/dir/myrepo/'})
+            self.assertEquals(name, 'myrepo')
+
+    def test_get_repository_name_from_options(self):
+        basedir = '/base/dir'
+        with self.settings(BASE_REPO_DIR=basedir):
+            name = self.module.get_repository_name({'repository': 'otherrepo'},
+                                                   {'REPREPRO_BASE_DIR': '/base/dir/myrepo'})
+            self.assertEquals(name, 'otherrepo')
+
+    def test_parse_dsc_file(self):
+        f = StringIO()
+        @contextmanager
+        def fake_open(filename, mode):
+            self.assertEquals(mode, 'r')
+            yield f
+            f.close()
+
+        with mock.patch('__builtin__.open', fake_open):
+            with mock.patch('repomgmt.management.commands.repo-import-dsc-to-git.Dsc') as Dsc:
+                self.module.parse_dsc_file('foo')
+                self.assertTrue(f.closed)
+                Dsc.assert_called_with(f)
+
+
+class UrlMatchingTests(TestCase):
+    fixtures = ['repos.yaml']
+
+    def test_repository_list(self):
+        c = client.Client()
+        response = c.get('/repositories/')
+        self.assertEquals(response.status_code, 200)
+
+    def test_series_list(self):
+        for repo in Repository.objects.all():
+            c = client.Client()
+            response = c.get('/repositories/%s/' % (repo.name,))
+            self.assertEquals(response.status_code, 200)
+            self.assertIn('seriess.html',
+                          [t.name for t in response.templates])
+
+    def test_package_list(self):
+        with mock.patch('repomgmt.models.Series.get_source_packages') as get_source_packages:
+            for series in Series.objects.all():
+                c = client.Client()
+                url = '/repositories/%s/%s/' % (series.repository.name, series.name)
+                response = c.get(url)
+                self.assertEquals(response.status_code, 200)
+                self.assertIn('packages.html',
+                              [t.name for t in response.templates])
+
+    def test_new_repository_form(self):
+        c = client.Client()
+        response = c.get('/repositories/new/')
+        self.assertEquals(response.status_code, 200)
+        self.assertIn('new_repository_form.html',
+                      [t.name for t in response.templates])
+
+    def test_new_series_form(self):
+        for repo in Repository.objects.all():
+            c = client.Client()
+            response = c.get('/repositories/%s/new/' % (repo.name,))
+            self.assertEquals(response.status_code, 200)
+            self.assertIn('new_series_form.html',
+                          [t.name for t in response.templates])
+
+    def test_repository_key(self):
+        for repo in Repository.objects.all():
+            c = client.Client()
+            response = c.get('/repositories/%s/key/' % (repo.name,))
+            self.assertEquals(response.status_code, 200)
+
+class PermissionsTests(TestCase):
+    def setUp(self):
+        self._create_users()
+        super(PermissionsTests, self).setUp()
+
+    def _create_users(self):
+        self.user1 = User(username='user1')
+        self.user1.save()
+
+        self.user2 = User(username='user2')
+        self.user2.save()
+
+        self.user3 = User(username='user3')
+        self.user3.save()
+
+        self.superuser = User(username='superuser')
+        self.superuser.is_superuser = True
+        self.superuser.save()
+
+    def _test_dump(self):
+        for x in Cloud, BuildNode, BuildRecord, KeyPair, Repository, User, UploaderKey:
+            print x.objects.all()
+
+    def test_repo_perm(self):
+        repo = Repository(name='repo1')
+        repo.save()
+        repo.uploaders.add(self.user1)
+
+        self.assertTrue(repo.can_modify(self.user1), 'User1 cannot modify repository')
+        self.assertFalse(repo.can_modify(self.user2), 'User2 can modify repository')
+        self.assertTrue(repo.can_modify(self.superuser), 'Super user cannot modify repository')
+
+    def test_series_perm(self):
+        repo = Repository(name='repo1')
+        repo.save()
+        repo.uploaders.add(self.user1)
+        repo.save()
+
+        series = Series(name='series1', base_ubuntu_series_id='precise', repository=repo)
+        series.save()
+
+        self.assertTrue(series.can_modify(self.user1), 'User1 cannot modify repository')
+        self.assertFalse(series.can_modify(self.user2), 'User2 can modify repository')
+        self.assertTrue(series.can_modify(self.superuser), 'Super user cannot modify repository')
+
+    def test_subscription_perm(self):
+        repo = Repository(name='repo1')
+        repo.save()
+        repo.uploaders.add(self.user1)
+        repo.save()
+
+        series = Series(name='series1', base_ubuntu_series_id='precise', repository=repo)
+        series.save()
+
+        pkg_src = PackageSource(code_url='scheme://foo/bar', packaging_url='scheme://foo/bar',
+                                flavor='OpenStack')
+        pkg_src.save()
+
+        sub = Subscription(target_series=series, source=pkg_src, counter=1)
+        sub.save()
+        self.assertTrue(sub.can_modify(self.user1), 'User1 cannot modify repository')
+        self.assertFalse(sub.can_modify(self.user2), 'User2 can modify repository')
+        self.assertTrue(sub.can_modify(self.superuser), 'Super user cannot modify repository')
+
+    def test_pkg_src_perm(self):
+        repo1 = Repository(name='repo1')
+        repo1.save()
+        repo1.uploaders.add(self.user1)
+        repo1.uploaders.add(self.user3)
+        repo1.save()
+
+        repo2 = Repository(name='repo2')
+        repo2.save()
+        repo2.uploaders.add(self.user2)
+        repo2.uploaders.add(self.user3)
+        repo2.save()
+
+        series1 = Series(name='series1', base_ubuntu_series_id='precise', repository=repo1)
+        series1.save()
+
+        series2 = Series(name='series2', base_ubuntu_series_id='precise', repository=repo2)
+        series2.save()
+
+        pkg_src = PackageSource(code_url='scheme://foo/bar', packaging_url='scheme://foo/bar', flavor='OpenStack')
+        pkg_src.save()
+
+        sub1 = Subscription(target_series=series1, source=pkg_src, counter=1)
+        sub1.save()
+        sub2 = Subscription(target_series=series2, source=pkg_src, counter=1)
+        sub2.save()
+        self.assertFalse(pkg_src.can_modify(self.user1), 'User1 can modify repository')
+        self.assertFalse(pkg_src.can_modify(self.user2), 'User2 can modify repository')
+        self.assertTrue(pkg_src.can_modify(self.user3), 'User3 cannot modify repository')
+        self.assertTrue(pkg_src.can_modify(self.superuser), 'Super user cannot modify repository')
+
+class APIPermissionsTest(TestCase):
+    def setUp(self):
+        self._create_users()
+        super(APIPermissionsTest, self).setUp()
+
+    def _get_client(self, username):
+        class Client(object):
+            def __init__(self, username):
+                self.client = client.Client(HTTP_AUTHORIZATION=('Basic ' + b64encode(('%s:%s' % (username, 'password')))))
+
+            def post(self, uri, data):
+                return self.client.post(uri, json.dumps(data), content_type='application/json')
+
+            def delete(self, uri):
+                return self.client.delete(uri)
+
+        return Client(username)
+
+    def _create_users(self):
+        self.user1 = User(username='user1')
+        self.user1.set_password('password')
+        self.user1.save()
+
+        self.user2 = User(username='user2')
+        self.user2.set_password('password')
+        self.user2.save()
+
+        self.superuser = User(username='superuser')
+        self.superuser.set_password('password')
+        self.superuser.is_superuser = True
+        self.superuser.save()
+
+    def test_superuser_can_create_architecture(self):
+        c = self._get_client('superuser')
+        response = c.post('/api/v1/architecture/', {'name': 'aarch64'})
+        self.assertEquals(response.status_code, 201)
+
+    def test_regular_user_cannot_create_architecture(self):
+        c = self._get_client('user1')
+        response = c.post('/api/v1/architecture/', {'name': 'aarch64'})
+        self.assertEquals(response.status_code, 401)
+
+    def test_regular_user_can_create_repository(self):
+        c = self._get_client('user1')
+        response = c.post('/api/v1/repository/', {'name': 'testuserrepo'})
+        self.assertEquals(response.status_code, 201)
+
+    def test_superuser_can_create_repository(self):
+        c = self._get_client('superuser')
+        response = c.post('/api/v1/repository/', {'name': 'testuserrepo'})
+        self.assertEquals(response.status_code, 201)
+
+    def test_user_can_delete_own_repository(self):
+        c = self._get_client('user1')
+        response = c.post('/api/v1/repository/', {'name': 'testuserrepo'})
+        self.assertEquals(response.status_code, 201)
+        response = c.delete('/api/v1/repository/testuserrepo/')
+        self.assertEquals(response.status_code, 204)
+
+    def test_user_cannot_delete_someone_elses_repository(self):
+        c = self._get_client('user1')
+        response = c.post('/api/v1/repository/', {'name': 'testuserrepo'})
+        self.assertEquals(response.status_code, 201)
+        c = self._get_client('user2')
+        response = c.delete('/api/v1/repository/testuserrepo/')
+        self.assertEquals(response.status_code, 401)
+
+    def test_user_can_create_series_on_own_repository(self):
+        c = self._get_client('user1')
+        response = c.post('/api/v1/repository/', {'name': 'testuserrepo'})
+        self.assertEquals(response.status_code, 201)
+        location = response['Location']
+        repouri = location[location.index('/api/v1'):]
+        response = c.post('/api/v1/series/', {'name': 'series1',
+                                              'repository': repouri,
+                                              'base_ubuntu_series': 'precise',
+                                              'state': 1,
+                                              'subscriptions': []})
+        self.assertEquals(response.status_code, 201)
+
+    def test_user_cannot_create_series_on_someone_elses_repository(self):
+        c = self._get_client('user1')
+        response = c.post('/api/v1/repository/', {'name': 'testuserrepo'})
+        self.assertEquals(response.status_code, 201)
+        location = response['Location']
+        repouri = location[location.index('/api/v1'):]
+        c = self._get_client('user2')
+        response = c.post('/api/v1/series/', {'name': 'series1',
+                                              'repository': repouri,
+                                              'base_ubuntu_series': 'precise',
+                                              'state': 1,
+                                              'subscriptions': []})
+        self.assertEquals(response.status_code, 401)
+

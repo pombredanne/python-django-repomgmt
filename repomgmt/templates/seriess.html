@@ -10,12 +10,12 @@ Once that's done, you can add this snippet to your <code>~/.dput.cf</code> (crea
 method   = ftp
 fqdn     = {{ settings.FTP_IP }}
 login    = anonymous
-incoming = {{ settings.FTP_BASE_URL }}/%(repo)s/
+incoming = {{ settings.FTP_BASE_PATH }}/%(repo)s/
 </pre>
 
 Once that's done, you can upload to this repository like so:
 <pre>
-dput repo:{{ repository.name }} foo_1.2-3_source.dsc
+dput repo:{{ repository.name }} foo_1.2-3_source.changes
 </pre>
 The upload will land in the series specified in the <code>.changes</code> file (which in turn is based on what you put in your <code>debian/changelog</code>). Packages with "<code>Distribution: foo</code>" will land in <code>foo-proposed</code>. Uploads are never accepted directly into <code>foo</code>.
 </p>
@@ -30,7 +30,7 @@ The upload will land in the series specified in the <code>.changes</code> file (
   <dt>No longer maintained</dt>
   <dd>Uploads are no longer accepted.</dd>
 </dl></p>
-<p><a href="{% url new_series_form repository_name=repository.name %}" class="btn pull-right">Create new</a></p>
+<p><a href="{% url "new_series_form" repository_name=repository.name %}" class="btn pull-right">Create new</a></p>
 <table class="table table-striped">
   <tr>
     <th>Series</th>

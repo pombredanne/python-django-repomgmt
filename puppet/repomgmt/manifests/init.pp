@@ -17,6 +17,7 @@ class repomgmt($user = 'buildd',
   include apache 
 
   $simple = false
+  $project_name = 'www'
 
   apache::vhost { "repomgmt":
     priority           => $priority,
@@ -33,13 +34,15 @@ class repomgmt($user = 'buildd',
              "ubuntu-dev-tools",
              "reprepro",
              "haveged",
-             "vsftpd"]:
+             "vsftpd",
+             "python-dev"]:
     provider => "apt",
     ensure => "installed",
   }
 
-  package { ["Django",
-             "django-celery",
+  Package["python-dev"] -> Package<| provider == 'pip' |>
+
+  package { ["django-celery",
              "django-tastypie",
              "django-south",
              "django-registration",
@@ -47,6 +50,12 @@ class repomgmt($user = 'buildd',
              "south"]:
     provider => "pip",
     ensure => "installed",
+    require => Package['python-pip']
+  }
+
+  package { "Django":
+    provider => "pip",
+    ensure => "1.4.3",
     require => Package['python-pip']
   }
 
@@ -65,6 +74,7 @@ class repomgmt($user = 'buildd',
     ensure => "present",
     managehome => true,
     groups => "sbuild",
+    shell => "/bin/bash",
     require => Package['sbuild']
   }
 
